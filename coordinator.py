@@ -9,6 +9,13 @@ the coordinator gathers the details and delegates to three specialist sub-agents
   🏛  Venue Agent     — searches the web for venues matching your location & capacity
   🎵  Playlist Agent  — queries a music database and curates a genre-matching playlist
 
+Features:
+  • Input validation  — guest count must be a positive integer; origin/destination required
+  • Follow-up questions — coordinator asks for missing details instead of guessing
+  • Structured output — consistent sections for flights, venues, and playlist
+  • Sample-data fallback — clearly labelled example results when a service is unavailable
+  • Improved error messages — each failure names the service and suggests next steps
+
 Built with: LangChain · LangGraph · Tavily · MCP (Kiwi Travel) · SQLite · Groq
 Author: Muhammad Ali Rehman (marehman-exe)
 Course: Introduction to LangChain – Python (LangChain Academy, Module 2)
@@ -74,15 +81,62 @@ class RetryMCPInterceptor:
             isError=False,
         )
 
+# ── Input validation ──────────────────────────────────────────────────────────
+
+REQUIRED_FIELDS = ("origin", "destination", "guest_count", "genre")
+
+def validate_inputs(
+    origin: str,
+    destination: str,
+    guest_count: str,
+    genre: str,
+) -> list[str]:
+    """Return a list of human-readable error strings.
+    An empty list means all inputs are valid.
+    """
+    errors: list[str] = []
+
+    if not origin or not origin.strip():
+        errors.append("Origin city is required (e.g. 'London').")
+    if not destination or not destination.strip():
+        errors.append("Destination city is required (e.g. 'Paris').")
+    if not genre or not genre.strip():
+        errors.append("Music genre is required (e.g. 'jazz').")
+
+    # guest_count must parse as a positive integer
+    if not guest_count or not guest_count.strip():
+        errors.append("Guest count is required (e.g. '100').")
+    else:
+        cleaned = guest_count.strip()
+        try:
+            n = int(cleaned)
+            if n <= 0:
+                errors.append(
+                    f"Guest count must be a positive whole number (got '{cleaned}')."
+                )
+        except ValueError:
+            errors.append(
+                f"Guest count must be a whole number (got '{cleaned}'). "
+                "Example: '80' or '120'."
+            )
+
+    return errors
+
+
 # ── Shared state ──────────────────────────────────────────────────────────────
 # WeddingState extends AgentState so the coordinator and sub-agents all share
-# the same four wedding fields — persisted per thread_id by InMemorySaver.
+# the wedding fields — persisted per thread_id by InMemorySaver.
+#
+# missing_fields  — fields the coordinator still needs to ask for
+# validation_errors — human-readable errors from validate_inputs()
 
 class WeddingState(AgentState):
-    origin: str         # e.g. "London"
-    destination: str    # e.g. "Paris"
-    guest_count: str    # e.g. "100"
-    genre: str          # e.g. "jazz"
+    origin: str            # e.g. "London"
+    destination: str       # e.g. "Paris"
+    guest_count: str       # e.g. "100"
+    genre: str             # e.g. "jazz"
+    missing_fields: list   # fields still needed before planning can proceed
+    validation_errors: list  # errors to show the user before retrying
 
 # ── Tools: web search + SQL ───────────────────────────────────────────────────
 
@@ -171,6 +225,48 @@ async def build_agents():
     # Each sub-agent is wrapped as a @tool so the coordinator can call it.
     # The coordinator reads wedding details from the shared WeddingState.
 
+    # Sample data — returned when a live service is unavailable.
+    # Clearly labelled as estimates so users know to verify with providers.
+    _SAMPLE_FLIGHTS = (
+        "[SAMPLE DATA — live flight search unavailable]\n"
+        "These are illustrative examples only. Verify with a travel provider.\n\n"
+        "• London Heathrow (LHR) → Paris CDG: ~£60–80 economy, ~1h 15min\n"
+        "• London Gatwick (LGW) → Paris Orly (ORY): ~£45–65 economy, ~1h 10min\n"
+        "Tip: book group flights 6–12 months in advance for best rates."
+    )
+    _SAMPLE_VENUES = (
+        "[SAMPLE DATA — live venue search unavailable]\n"
+        "These are illustrative examples only. Verify with venues directly.\n\n"
+        "• Hôtel Rochechouart, Paris — capacity ~120, est. €8,000–€12,000\n"
+        "• La Salle Pleyel, Paris    — capacity ~100, est. €10,000–€18,000\n"
+        "• Château de Vaux-le-Vicomte — capacity ~150, est. €15,000–€25,000"
+    )
+    _SAMPLE_PLAYLIST = (
+        "[SAMPLE DATA — music database query unavailable]\n"
+        "These are illustrative jazz tracks only.\n\n"
+        "• So What — Miles Davis, 9:22\n"
+        "• Take Five — Dave Brubeck, 5:24\n"
+        "• All Blues — Miles Davis, 5:37\n"
+        "• Autumn Leaves — Bill Evans, 5:52\n"
+        "Est. total: ~26 min for 4 tracks"
+    )
+
+    @tool
+    def ask_followup(question: str, missing: str, runtime: ToolRuntime) -> Command:
+        """Ask the user a follow-up question when required details are missing.
+        Use this instead of guessing. Provide a clear, friendly question.
+        'missing' is a comma-separated list of the field names still needed."""
+        missing_list = [f.strip() for f in missing.split(",") if f.strip()]
+        return Command(
+            update={
+                "missing_fields": missing_list,
+                "messages": [ToolMessage(
+                    question,
+                    tool_call_id=runtime.tool_call_id,
+                )],
+            }
+        )
+
     @tool
     def update_state(
         origin: str,
@@ -180,16 +276,37 @@ async def build_agents():
         runtime: ToolRuntime,
     ) -> Command:
         """Save the wedding details (origin, destination, guest_count, genre) to shared state.
+        Validates all four fields before saving. If validation fails, the errors are saved
+        to state and returned so the coordinator can ask the user to fix them.
         Call this FIRST, before delegating to any sub-agent. Call it alone — no parallel calls."""
+        # Validate before writing — never store bad values in state
+        errors = validate_inputs(origin, destination, guest_count, genre)
+        if errors:
+            error_text = (
+                "The following details need to be corrected before planning can continue:\n"
+                + "\n".join(f"  • {e}" for e in errors)
+            )
+            return Command(
+                update={
+                    "validation_errors": errors,
+                    "messages": [ToolMessage(
+                        error_text,
+                        tool_call_id=runtime.tool_call_id,
+                    )],
+                }
+            )
         return Command(
             update={
-                "origin": origin,
-                "destination": destination,
-                "guest_count": guest_count,
-                "genre": genre,
+                "origin": origin.strip(),
+                "destination": destination.strip(),
+                "guest_count": guest_count.strip(),
+                "genre": genre.strip(),
+                "missing_fields": [],
+                "validation_errors": [],
                 "messages": [ToolMessage(
-                    f"State updated: {origin} → {destination}, "
-                    f"{guest_count} guests, {genre} music",
+                    f"Details saved: {origin.strip()} → {destination.strip()}, "
+                    f"{guest_count.strip()} guests, {genre.strip()} music. "
+                    "Ready to start planning.",
                     tool_call_id=runtime.tool_call_id,
                 )],
             }
@@ -198,50 +315,114 @@ async def build_agents():
     @tool
     async def search_flights(runtime: ToolRuntime) -> str:
         """Delegate to the travel sub-agent to find flights using the wedding origin and destination."""
-        origin = runtime.state["origin"]
-        destination = runtime.state["destination"]
-        response = await travel_agent.ainvoke({
-            "messages": [HumanMessage(content=f"Find flights from {origin} to {destination}")]
-        })
-        return response["messages"][-1].content
+        origin = runtime.state.get("origin", "")
+        destination = runtime.state.get("destination", "")
+        if not origin or not destination:
+            return (
+                "[Flight Search — Missing Info]\n"
+                "Origin or destination is not set. "
+                "Please provide both before searching for flights."
+            )
+        try:
+            response = await travel_agent.ainvoke({
+                "messages": [HumanMessage(
+                    content=f"Find flights from {origin} to {destination}"
+                )]
+            })
+            result = response["messages"][-1].content
+            # Tag the section header for consistent output formatting
+            return f"✈ FLIGHTS ({origin} → {destination})\n{'-'*50}\n{result}"
+        except Exception as exc:
+            # Named failure — tells the user which service broke and what to do
+            return (
+                f"✈ FLIGHTS — Service Unavailable\n"
+                f"The flight search service could not be reached ({exc}).\n"
+                f"You can retry, or use the sample data below:\n\n{_SAMPLE_FLIGHTS}"
+            )
 
     @tool
     def search_venues(runtime: ToolRuntime) -> str:
         """Delegate to the venue sub-agent to find venues at the destination for the guest count."""
-        destination = runtime.state["destination"]
-        guest_count = runtime.state["guest_count"]
-        response = venue_agent.invoke({
-            "messages": [HumanMessage(
-                content=f"Find wedding venues in {destination} for {guest_count} guests"
-            )]
-        })
-        return response["messages"][-1].content
+        destination = runtime.state.get("destination", "")
+        guest_count = runtime.state.get("guest_count", "")
+        if not destination or not guest_count:
+            return (
+                "[Venue Search — Missing Info]\n"
+                "Destination or guest count is not set. "
+                "Please provide both before searching for venues."
+            )
+        try:
+            response = venue_agent.invoke({
+                "messages": [HumanMessage(
+                    content=f"Find wedding venues in {destination} for {guest_count} guests"
+                )]
+            })
+            result = response["messages"][-1].content
+            return f"🏛 VENUES ({destination}, {guest_count} guests)\n{'-'*50}\n{result}"
+        except Exception as exc:
+            return (
+                f"🏛 VENUES — Service Unavailable\n"
+                f"The venue search service could not be reached ({exc}).\n"
+                f"You can retry, or use the sample data below:\n\n{_SAMPLE_VENUES}"
+            )
 
     @tool
     def suggest_playlist(runtime: ToolRuntime) -> str:
         """Delegate to the playlist sub-agent to curate a playlist for the wedding genre."""
-        genre = runtime.state["genre"]
-        response = playlist_agent.invoke({
-            "messages": [HumanMessage(content=f"Find {genre} tracks for a wedding playlist")]
-        })
-        return response["messages"][-1].content
+        genre = runtime.state.get("genre", "")
+        if not genre:
+            return (
+                "[Playlist — Missing Info]\n"
+                "Music genre is not set. Please provide a genre before building a playlist."
+            )
+        try:
+            response = playlist_agent.invoke({
+                "messages": [HumanMessage(
+                    content=f"Find {genre} tracks for a wedding playlist"
+                )]
+            })
+            result = response["messages"][-1].content
+            return f"🎵 PLAYLIST ({genre})\n{'-'*50}\n{result}"
+        except Exception as exc:
+            return (
+                f"🎵 PLAYLIST — Service Unavailable\n"
+                f"The music database could not be reached ({exc}).\n"
+                f"You can retry, or use the sample data below:\n\n{_SAMPLE_PLAYLIST}"
+            )
 
     # ── Coordinator ───────────────────────────────────────────────────────────
 
     coordinator = create_agent(
         model="groq:openai/gpt-oss-120b",
-        tools=[update_state, search_flights, search_venues, suggest_playlist],
+        tools=[ask_followup, update_state, search_flights, search_venues, suggest_playlist],
         state_schema=WeddingState,
         system_prompt="""
         You are a wedding coordinator managing a dream team of specialists.
 
         Your workflow — follow this order strictly:
-        1. Extract origin, destination, guest_count, and genre from the user's message.
-        2. Call update_state with all four values. Wait for it to complete before proceeding.
-        3. Call search_flights, search_venues, and suggest_playlist (can run after state is set).
-        4. Compile all results into a clear, well-formatted wedding plan for the user.
 
-        Do NOT ask follow-up questions. Work with the information provided.
+        STEP 1 — Check for required details.
+        You need four pieces of information: origin city, destination city,
+        guest count (a positive whole number), and music genre.
+        If any are missing from the user's message, call ask_followup with a clear,
+        friendly question listing exactly what is needed. Then wait for the user's reply.
+
+        STEP 2 — Save the details.
+        Once you have all four values, call update_state. If update_state returns
+        validation errors, relay them to the user and ask them to correct the details.
+        Do not proceed to planning until update_state confirms the details are saved.
+
+        STEP 3 — Run the specialists.
+        Call search_flights, search_venues, and suggest_playlist.
+
+        STEP 4 — Compile the plan.
+        Format the final answer with these sections in order:
+          SUMMARY    — one sentence with destination, guest count, and genre
+          ✈ FLIGHTS  — shortlisted flight options
+          🏛 VENUES  — shortlisted venue options
+          🎵 PLAYLIST — curated track list with total duration and cost
+        If a section shows "Service Unavailable", include it with the sample data
+        and note that the user should verify with providers directly.
         """,
     )
 
@@ -251,13 +432,18 @@ async def build_agents():
 
 async def main():
     coordinator = await build_agents()
+
+    # Each session gets its own thread_id so planning runs stay separate.
+    # Using a fixed ID here keeps the conversation continuous across turns.
     config = {
         "tags": ["wedding-planner"],
         "recursion_limit": 40,  # multi-agent chains can be deep
+        "configurable": {"thread_id": "wedding-session-1"},
     }
 
-    print("Destination Wedding Planner  |  type 'quit' to exit\n")
-    print("Example: I'm from London and I'd like a wedding in Paris for 100 guests, jazz genre")
+    print("Destination Wedding Planner  |  type 'quit' to exit")
+    print("Required: origin city, destination city, guest count, music genre")
+    print("Example : I'm from London, wedding in Paris for 100 guests, jazz genre")
     print("-" * 70)
 
     while True:
@@ -268,13 +454,26 @@ async def main():
         if not user_input:
             continue
 
-        print("\n[Planning your wedding — this may take 1–2 minutes...]\n")
+        print("\n[Working on your wedding plan — this may take 1–2 minutes...]\n")
 
         response = await coordinator.ainvoke(
             {"messages": [HumanMessage(content=user_input)]},
             config=config,
         )
-        print(f"Coordinator:\n{response['messages'][-1].content}")
+
+        # If the coordinator asked a follow-up question, surface it clearly
+        missing = response.get("missing_fields") or []
+        val_errors = response.get("validation_errors") or []
+
+        if val_errors:
+            print("Coordinator: Please correct the following before we continue:")
+            for err in val_errors:
+                print(f"  • {err}")
+        elif missing:
+            # The last message is the follow-up question — print it as-is
+            print(f"Coordinator: {response['messages'][-1].content}")
+        else:
+            print(f"Coordinator:\n{response['messages'][-1].content}")
 
 if __name__ == "__main__":
     asyncio.run(main())
